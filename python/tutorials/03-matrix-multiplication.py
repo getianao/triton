@@ -237,6 +237,7 @@ def get_autotune_config():
 @triton.autotune(
     configs=get_autotune_config(),
     key=['M', 'N', 'K'],
+    reset_to_zero=["c_ptr"],
 )
 @triton.jit
 def matmul_kernel(
@@ -305,7 +306,8 @@ def matmul_kernel(
     # while the accumulator is still in FP32!
     if ACTIVATION == "leaky_relu":
         accumulator = leaky_relu(accumulator)
-    c = accumulator.to(tl.float16)
+    c = accumulator.to(tl.float32)
+    # c = accumulator
 
     # -----------------------------------------------------------
     # Write back the block of the output matrix C with masks.
@@ -313,7 +315,8 @@ def matmul_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+    # tl.store(c_ptrs, c, mask=c_mask)
+    tl.atomic_add(c_ptrs, c, mask=c_mask)
 
 
 # We can fuse `leaky_relu` by providing it as an `ACTIVATION` meta-parameter in `matmul_kernel`.
@@ -334,7 +337,7 @@ def matmul(a, b, activation=""):
     M, K = a.shape
     K, N = b.shape
     # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    c = torch.zeros((M, N), device=a.device, dtype=torch.float32)
     # 1D launch kernel where each block gets its own program.
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
     matmul_kernel[grid](
@@ -343,7 +346,8 @@ def matmul(a, b, activation=""):
         a.stride(0), a.stride(1),  #
         b.stride(0), b.stride(1),  #
         c.stride(0), c.stride(1),  #
-        ACTIVATION=activation  #
+        ACTIVATION=activation,  #,
+        # BLOCK_SIZE_M=256, BLOCK_SIZE_N=256, BLOCK_SIZE_K=64, GROUP_SIZE_M=8
     )
     return c
 
@@ -355,8 +359,8 @@ def matmul(a, b, activation=""):
 # We can test our custom matrix multiplication operation against a native torch implementation (i.e., cuBLAS).
 
 torch.manual_seed(0)
-a = torch.randn((512, 512), device='cuda', dtype=torch.float16)
-b = torch.randn((512, 512), device='cuda', dtype=torch.float16)
+a = torch.randn((512, 512), device='cuda', dtype=torch.float32)
+b = torch.randn((512, 512), device='cuda', dtype=torch.float32)
 triton_output = matmul(a, b)
 torch_output = torch.matmul(a, b)
 print(f"triton_output_with_fp16_inputs={triton_output}")
@@ -370,7 +374,8 @@ if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol):
 else:
     print("❌ Triton and Torch differ")
 
-TORCH_HAS_FP8 = hasattr(torch, "float8_e5m2")
+# TORCH_HAS_FP8 = hasattr(torch, "float8_e5m2")
+TORCH_HAS_FP8 = False
 if TORCH_HAS_FP8 and is_cuda():
     torch.manual_seed(0)
     a = torch.randn((512, 512), device="cuda", dtype=torch.float16)
@@ -401,13 +406,17 @@ if TORCH_HAS_FP8 and is_cuda():
 ref_lib = 'cuBLAS' if is_cuda() else 'rocBLAS'
 
 configs = []
-for fp8_inputs in [False, True]:
+
+print([128 * i for i in range(2, 33)])
+# for fp8_inputs in [False, True]:
+for fp8_inputs in [False, ]:
     if fp8_inputs and (not TORCH_HAS_FP8 or not is_cuda()):
         continue
     configs.append(
         triton.testing.Benchmark(
             x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
             x_vals=[128 * i for i in range(2, 33)],  # Different possible values for `x_name`
+            # x_vals=[(102400, 16 * (i), 16 * (i)) for i in range(2, 33)],  # Different possible values for `x_name`
             line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
             # Possible values for `line_arg`
             # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
@@ -423,8 +432,8 @@ for fp8_inputs in [False, True]:
 
 @triton.testing.perf_report(configs)
 def benchmark(M, N, K, provider, fp8_inputs):
-    a = torch.randn((M, K), device='cuda', dtype=torch.float16)
-    b = torch.randn((K, N), device='cuda', dtype=torch.float16)
+    a = torch.randn((M, K), device='cuda', dtype=torch.float32)
+    b = torch.randn((K, N), device='cuda', dtype=torch.float32)
     if TORCH_HAS_FP8 and fp8_inputs:
         a = a.to(torch.float8_e5m2)
         b = b.T

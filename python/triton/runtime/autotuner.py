@@ -27,6 +27,7 @@ class Autotuner(KernelInterface):
         warmup=25,
         rep=100,
         use_cuda_graph=False,
+        reset_to_zero_size_list=None,
     ):
         """
         :param prune_configs_by: a dict of functions that are used to prune configs, fields:
@@ -46,6 +47,9 @@ class Autotuner(KernelInterface):
         self.reset_idx = []
         if reset_to_zero is not None:
             self.reset_idx = [arg_names.index(k) for k in reset_to_zero]
+        self.reset_size_list_idx = []
+        if reset_to_zero_size_list is not None:
+            self.reset_size_list_idx += [arg_names.index(k) for k in reset_to_zero_size_list]
         self.restore_idx = []
         if restore_value is not None:
             self.restore_idx = [arg_names.index(k) for k in restore_value]
@@ -56,8 +60,28 @@ class Autotuner(KernelInterface):
         if pre_hook:
             self.pre_hook = pre_hook
         elif (len(self.reset_idx) > 0 or len(self.restore_idx) > 0):
+            import cupy as cp
+            def ptr_to_tensor(device_ptr: int, nbytes: int, shape: tuple):
+                # print(device_ptr, nbytes, shape)
+                mem = cp.cuda.UnownedMemory(device_ptr, nbytes, owner=None)
+                memptr = cp.cuda.MemoryPointer(mem, offset=0)
+                arr = cp.ndarray(shape, dtype=cp.float32, memptr=memptr)
+                # print(arr)
+                return torch.as_tensor(arr, device="cuda")
 
             def _pre_hook(args, reset_only=False):
+                if len(self.reset_size_list_idx) > 0:
+                    assert len(self.reset_size_list_idx) == 1
+                    size_list = args[self.reset_size_list_idx[0]]
+                    for tp_index, tp in enumerate(args[self.reset_idx[0]]):
+                        # print(args[self.reset_idx[0]])
+                        t = ptr_to_tensor(
+                            tp.item(),
+                            4 * size_list[tp_index * 3 : tp_index * 3 + 2].prod().item(),
+                            tuple(size_list[tp_index * 3 : tp_index * 3 + 2].tolist()),
+                        )
+                        t.zero_()
+                    return
                 for i in self.reset_idx:
                     args[i].zero_()
                 if not reset_only:
@@ -260,7 +284,7 @@ class Config:
 
 
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, pre_hook=None, post_hook=None,
-             warmup=25, rep=100, use_cuda_graph=False):
+             warmup=25, rep=100, use_cuda_graph=False, reset_to_zero_size_list=None):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
 
@@ -317,7 +341,7 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     def decorator(fn):
         return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                          post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
-                         use_cuda_graph=use_cuda_graph)
+                         use_cuda_graph=use_cuda_graph, reset_to_zero_size_list=reset_to_zero_size_list)
 
     return decorator
 
