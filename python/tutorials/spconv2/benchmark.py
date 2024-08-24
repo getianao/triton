@@ -31,7 +31,6 @@ import torch
 import triton
 import triton.language as tl
 
-from grouped_gemm import grouped_matmul_kernel
 from grouped_gemm_atomic import grouped_matmul_kernel_atomic
 
 
@@ -71,7 +70,7 @@ def group_gemm_fn(group_A, group_B, tl_dtype: tl.constexpr):
     M_acc = sum([g_sizes[3 * i] for i in range(group_size)])
     N_single = g_sizes[1]
     K_single = g_sizes[2]
-    grouped_matmul_kernel[grid](
+    grouped_matmul_kernel_atomic[grid](
         d_a_ptrs,
         d_b_ptrs,
         d_c_ptrs,
@@ -125,37 +124,6 @@ def validate(datatype="fp32"):
             print("Validation succeeded")
 
 
-# only launch the kernel, no tensor preparation here to remove all overhead
-def triton_perf_fn(
-    a_ptrs,
-    b_ptrs,
-    c_ptrs,
-    sizes,
-    a_row_index_ptrs,
-    c_row_index_ptrs,
-    lds,
-    group_size,
-    M_acc,
-    N_single,
-    K_single,
-    tl_dtype: tl.constexpr,
-):
-    grid = lambda META: (META["NUM_SM"],)
-    grouped_matmul_kernel[grid](
-        a_ptrs,
-        b_ptrs,
-        c_ptrs,
-        sizes,
-        a_row_index_ptrs,
-        c_row_index_ptrs,
-        lds,
-        group_size,
-        M_acc,
-        N_single,
-        K_single,
-        in_dtype = tl_dtype,
-        out_dtype = tl_dtype,
-    )
 
 def triton_atomic_perf_fn(
     a_ptrs,
@@ -199,14 +167,13 @@ if __name__ == '__main__':
         triton.testing.Benchmark(
             # argument names to use as an x-axis for the plot
             x_names=["M", "N", "K"],
-            # x_vals=[2**i for i in range(7, 11)],  # different possible values for `x_name`
-            x_vals=[(2**i, 2**i, 2**i) for i in range(7, 13)],
+            x_vals=[(10240, 2**i, 2**i) for i in range(4, 10)],  # different possible values for `x_name`
             line_arg="provider",
             # argument name whose value corresponds to a different line in the plot
             # possible values for `line_arg``
-            line_vals=["cublas", "triton", "triton_atomic"],
+            line_vals=["cublas", "triton_atomic"],
             # label name for the lines
-            line_names=["cuBLAS", "Triton", "Triton_Atomic"],
+            line_names=["cuBLAS", "Triton_Atomic"],
             # line_vals=["triton"],  line_names=["Triton"],
             # line styles
             styles=[("green", "-"), ("blue", "-"), ("red", "-")],
@@ -228,6 +195,8 @@ if __name__ == '__main__':
         group_C = []
         A_row_index_addrs = []
         C_row_index_addrs = []
+        A_row_index_group = [] # to keep indices tensors alive
+        C_row_index_group = [] # to keep indices tensors alive
 
         if datatype == "fp32":
             torch_dtype = torch.float32
@@ -253,6 +222,8 @@ if __name__ == '__main__':
             C_addrs.append(C.data_ptr())
             A_row_index_addrs.append(A_row_index.data_ptr())
             C_row_index_addrs.append(C_row_index.data_ptr())
+            A_row_index_group.append(A_row_index) 
+            C_row_index_group.append(C_row_index)
             g_sizes += [M, N, K]
             g_lds += [A.stride(0), B.stride(0), C.stride(0)]
 
@@ -273,26 +244,6 @@ if __name__ == '__main__':
         if provider == "cublas":
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: torch_perf_fn(group_A, group_B),
-                quantiles=quantiles,
-                warmup=25,
-                rep=100,
-            )
-        if provider == "triton":
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: triton_perf_fn(
-                    d_a_ptrs,
-                    d_b_ptrs,
-                    d_c_ptrs,
-                    d_g_sizes,
-                    d_a_row_index_ptrs,
-                    d_c_row_index_ptrs,
-                    d_g_lds,
-                    group_size,
-                    M_acc,
-                    N_single,
-                    K_single,
-                    tl_dtype=tl_dtype,
-                ),
                 quantiles=quantiles,
                 warmup=25,
                 rep=100,
