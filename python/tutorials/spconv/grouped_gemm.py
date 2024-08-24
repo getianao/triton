@@ -2,13 +2,43 @@ import triton
 import triton.language as tl
 from config import get_cuda_autotune_config
 
+import cupy as cp
+import torch
+
+
+def ptr_to_tensor(device_ptr: int, nbytes: int, shape: tuple, dtype):
+    # print(device_ptr, nbytes, shape)
+    if dtype == tl.float32:
+        cp_dtype = cp.float32
+    elif dtype == tl.float16:
+        cp_dtype = cp.float16
+    else:
+        raise ValueError("Invalid datatype")
+    mem = cp.cuda.UnownedMemory(device_ptr, nbytes, owner=None)
+    memptr = cp.cuda.MemoryPointer(mem, offset=0)
+    arr = cp.ndarray(shape, dtype=cp_dtype, memptr=memptr)
+    return torch.as_tensor(arr, device="cuda")
+
+
+def _pre_hook(args, **kwargs):
+    group_c_ptrs = args[2]  # hard code
+    group_gemm_sizes = args[3]  # hard code
+    dtype = kwargs["out_dtype"]  # hard code
+    for tp_index, tp in enumerate(group_c_ptrs):
+        t = ptr_to_tensor(
+            tp.item(),
+            4 * group_gemm_sizes[tp_index * 3 : tp_index * 3 + 2].prod().item(),
+            tuple(group_gemm_sizes[tp_index * 3 : tp_index * 3 + 2].tolist()),
+            dtype,
+        )
+        t.zero_()
+
 
 @triton.autotune(
     configs=get_cuda_autotune_config(),
     warmup=25, rep=100,
     key=['group_size', 'N_single', 'K_single'],
-    # reset_to_zero= ['group_c_ptrs'],
-    reset_to_zero_size_list= ['group_gemm_sizes'],
+    pre_hook=_pre_hook,
 )
 @triton.jit
 def grouped_matmul_kernel(
@@ -31,6 +61,8 @@ def grouped_matmul_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    in_dtype: tl.constexpr,
+    out_dtype: tl.constexpr,
 ):
     tile_idx = tl.program_id(0)
     last_problem_end = 0
@@ -49,9 +81,9 @@ def grouped_matmul_kernel(
             lda = tl.load(g_lds + g * 3)
             ldb = tl.load(g_lds + g * 3 + 1)
             ldc = tl.load(g_lds + g * 3 + 2)
-            a_ptr = tl.load(group_a_ptrs + g).to(tl.pointer_type(tl.float32))
-            b_ptr = tl.load(group_b_ptrs + g).to(tl.pointer_type(tl.float32))
-            c_ptr = tl.load(group_c_ptrs + g).to(tl.pointer_type(tl.float32))
+            a_ptr = tl.load(group_a_ptrs + g).to(tl.pointer_type(in_dtype))
+            b_ptr = tl.load(group_b_ptrs + g).to(tl.pointer_type(in_dtype))
+            c_ptr = tl.load(group_c_ptrs + g).to(tl.pointer_type(out_dtype))
             # figure out tile coordinates
             tile_idx_in_gemm = tile_idx - last_problem_end
             tile_m_idx = tile_idx_in_gemm // num_n_tiles
@@ -71,19 +103,16 @@ def grouped_matmul_kernel(
                 # assume full tile for now
                 a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs)
-                accumulator += tl.dot(a, b, input_precision="tf32")
+                accumulator += tl.dot(a, b, out_dtype=in_dtype)
                 a_ptrs += BLOCK_SIZE_K
                 b_ptrs += BLOCK_SIZE_K * ldb
-            # c = accumulator.to(tl.float32)
-            c = accumulator
+            c = accumulator.to(out_dtype)
 
             offs_cm = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
             offs_cn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
             c_ptrs = c_ptr + ldc * offs_cm[:, None] + offs_cn[None, :]
-
             # assumes full tile for now
             tl.store(c_ptrs, c)
-            # tl.atomic_add(c_ptrs, c)
 
             # go to the next tile by advancing NUM_SM
             tile_idx += NUM_SM
