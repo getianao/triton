@@ -1,9 +1,10 @@
 import triton
 import triton.language as tl
-from config import get_cuda_autotune_config
+from config import get_cuda_autotune_config, _early_config_prune
 
 import cupy as cp
 import torch
+import functools
 
 
 def ptr_to_tensor(device_ptr: int, nbytes: int, shape: tuple, dtype):
@@ -36,6 +37,9 @@ def _pre_hook(args, **kwargs):
 
 @triton.autotune(
     configs=get_cuda_autotune_config(),
+    prune_configs_by={
+        'early_config_prune': functools.partial(_early_config_prune, is_weight=False),
+    },
     warmup=25, rep=100,
     key=['group_size', 'N_single', 'K_single'],
     pre_hook=_pre_hook,
@@ -86,18 +90,25 @@ def grouped_matmul_kernel(
             a_ptr = tl.load(group_a_ptrs + g).to(tl.pointer_type(in_dtype))
             b_ptr = tl.load(group_b_ptrs + g).to(tl.pointer_type(in_dtype))
             c_ptr = tl.load(group_c_ptrs + g).to(tl.pointer_type(out_dtype))
+            a_row_index_ptr = tl.load(group_a_row_index_ptrs + g).to(tl.pointer_type(tl.int32))
+            c_row_index_ptr = tl.load(group_c_row_index_ptrs + g).to(tl.pointer_type(tl.int32))
             # figure out tile coordinates
             tile_idx_in_gemm = tile_idx - last_problem_end
             tile_m_idx = tile_idx_in_gemm // num_n_tiles
             tile_n_idx = tile_idx_in_gemm % num_n_tiles
 
             # do regular gemm here
+            # Matrix a elements pointers
             offs_am = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-            offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            offs_am_index_ptrs = a_row_index_ptr + offs_am
+            offs_am_index = tl.load(offs_am_index_ptrs)
             offs_k = tl.arange(0, BLOCK_SIZE_K)
-            a_ptrs = a_ptr + offs_am[:, None] * lda + offs_k[None, :]
+            a_ptrs = a_ptr + offs_am_index[:, None] * lda + offs_k[None, :]
+            # Matrix b elements pointers
+            offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
             b_ptrs = b_ptr + offs_k[:, None] * ldb + offs_bn[None, :]
-            accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+            accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=in_dtype)
             for kk in range(0, tl.cdiv(k, BLOCK_SIZE_K)):
                 # hint to Triton compiler to do proper loop pipelining
                 tl.multiple_of(a_ptrs, [16, 16])
@@ -109,10 +120,13 @@ def grouped_matmul_kernel(
                 a_ptrs += BLOCK_SIZE_K
                 b_ptrs += BLOCK_SIZE_K * ldb
             c = accumulator.to(out_dtype)
-
+            # Matrix c elements pointers
             offs_cm = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            offs_cm_index_ptrs = c_row_index_ptr + offs_cm
+            offs_cm_index = tl.load(offs_cm_index_ptrs)
             offs_cn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-            c_ptrs = c_ptr + ldc * offs_cm[:, None] + offs_cn[None, :]
+            c_ptrs = c_ptr + ldc * offs_cm_index[:, None] + offs_cn[None, :]
+
             # assumes full tile for now
             tl.store(c_ptrs, c)
 

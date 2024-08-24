@@ -1,9 +1,10 @@
 import triton
 import triton.language as tl
-from config import get_cuda_autotune_config
+from config import get_cuda_autotune_config, _early_config_prune
 
 import cupy as cp
 import torch
+import functools
 
 
 def ptr_to_tensor(device_ptr: int, nbytes: int, shape: tuple, dtype):
@@ -39,6 +40,9 @@ def _pre_hook(args, **kwargs):
     warmup=25, rep=100,
     key=['group_size', 'N_single', 'K_single'],
     pre_hook=_pre_hook,
+    prune_configs_by={
+        'early_config_prune': functools.partial(_early_config_prune, is_weight=False),
+    },
 )
 @triton.jit
 def grouped_matmul_kernel(

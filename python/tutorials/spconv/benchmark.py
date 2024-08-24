@@ -192,7 +192,8 @@ if __name__ == '__main__':
             # argument names to use as an x-axis for the plot
             x_names=["M", "N", "K"],
             # x_vals=[2**i for i in range(7, 11)],  # different possible values for `x_name`
-            x_vals=[(2**i, 2**i, 2**i) for i in range(7, 13)],
+            x_vals=[(10240, 2**i, 2**i) for i in range(4, 10)],
+            # x_vals=[(2**i, 2**i, 2**i) for i in range(7, 13)],
             line_arg="provider",
             # argument name whose value corresponds to a different line in the plot
             # possible values for `line_arg``
