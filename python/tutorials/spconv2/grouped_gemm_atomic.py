@@ -38,18 +38,20 @@ def _pre_hook(args, **kwargs):
 @triton.autotune(
     configs=get_cuda_autotune_config(),
     prune_configs_by={
-        'early_config_prune': functools.partial(_early_config_prune, is_weight=False),
+        "early_config_prune": functools.partial(_early_config_prune, is_weight=False),
     },
-    warmup=25, rep=100,
-    key=['group_size', 'N_single', 'K_single'],
-    pre_hook=_pre_hook,
+    warmup=25,
+    rep=100,
+    key=["group_size", "N_single", "K_single"],
+    reset_to_zero=["output_features_ptr"],
+    # pre_hook=_pre_hook,
 )
 @triton.jit
 def grouped_matmul_kernel_atomic(
     # device tensor of matrices pointers
-    group_a_ptrs,
-    group_b_ptrs,
-    group_c_ptrs,
+    input_features_ptr,
+    weights_ptr,
+    output_features_ptr,
     # device tensor of gemm sizes. its shape is [group_size, 3]
     # dim 0 is group_size, dim 1 is the values of <M, N, K> of each gemm
     group_gemm_sizes,
@@ -69,6 +71,7 @@ def grouped_matmul_kernel_atomic(
     BLOCK_SIZE_K: tl.constexpr,
     in_dtype: tl.constexpr,
     out_dtype: tl.constexpr,
+    atomic_c: tl.constexpr,
 ):
     tile_idx = tl.program_id(0)
     last_problem_end = 0
@@ -84,12 +87,12 @@ def grouped_matmul_kernel_atomic(
         while (tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles):
             # pick up a tile from the current gemm problem
             k = gk
-            lda = tl.load(g_lds + g * 3)
-            ldb = tl.load(g_lds + g * 3 + 1)
-            ldc = tl.load(g_lds + g * 3 + 2)
-            a_ptr = tl.load(group_a_ptrs + g).to(tl.pointer_type(in_dtype))
-            b_ptr = tl.load(group_b_ptrs + g).to(tl.pointer_type(in_dtype))
-            c_ptr = tl.load(group_c_ptrs + g).to(tl.pointer_type(out_dtype))
+            lda = tl.load(g_lds)
+            ldb = tl.load(g_lds + 1)
+            ldc = tl.load(g_lds + 2)
+            a_ptr = input_features_ptr
+            b_ptr = weights_ptr + g * K_single * N_single
+            c_ptr = output_features_ptr
             a_row_index_ptr = tl.load(group_a_row_index_ptrs + g).to(tl.pointer_type(tl.int32))
             c_row_index_ptr = tl.load(group_c_row_index_ptrs + g).to(tl.pointer_type(tl.int32))
             # figure out tile coordinates
@@ -128,7 +131,10 @@ def grouped_matmul_kernel_atomic(
             c_ptrs = c_ptr + ldc * offs_cm_index[:, None] + offs_cn[None, :]
 
             # assumes full tile for now
-            tl.atomic_add(c_ptrs, c)
+            if atomic_c:
+                tl.atomic_add(c_ptrs, c)
+            else:
+                tl.store(c_ptrs, c)
 
             # go to the next tile by advancing NUM_SM
             tile_idx += NUM_SM

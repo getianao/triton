@@ -124,11 +124,10 @@ def validate(datatype="fp32"):
             print("Validation succeeded")
 
 
-
 def triton_atomic_perf_fn(
-    a_ptrs,
-    b_ptrs,
-    c_ptrs,
+    input_features,
+    weights,
+    output_features,
     sizes,
     a_row_index_ptrs,
     c_row_index_ptrs,
@@ -138,12 +137,13 @@ def triton_atomic_perf_fn(
     N_single,
     K_single,
     tl_dtype: tl.constexpr,
+    atomic_c: tl.constexpr,
 ):
     grid = lambda META: (META["NUM_SM"],)
     grouped_matmul_kernel_atomic[grid](
-        a_ptrs,
-        b_ptrs,
-        c_ptrs,
+        input_features,
+        weights,
+        output_features,
         sizes,
         a_row_index_ptrs,
         c_row_index_ptrs,
@@ -152,6 +152,7 @@ def triton_atomic_perf_fn(
         M_acc, N_single, K_single,
         in_dtype = tl_dtype,
         out_dtype = tl_dtype,
+        atomic_c = atomic_c,
     )
 
 def torch_perf_fn(group_A, group_B):
@@ -167,14 +168,15 @@ if __name__ == '__main__':
         triton.testing.Benchmark(
             # argument names to use as an x-axis for the plot
             x_names=["M", "N", "K"],
-            x_vals=[(10240, 2**i, 2**i) for i in range(4, 10)],  # different possible values for `x_name`
+            x_vals=[
+                (5120, 2**i, 2**i) for i in range(4, 10)
+            ],  # different possible values for `x_name`
             line_arg="provider",
             # argument name whose value corresponds to a different line in the plot
             # possible values for `line_arg``
-            line_vals=["cublas", "triton_atomic"],
+            line_vals=["triton", "triton_atomic"],
             # label name for the lines
-            line_names=["cuBLAS", "Triton_Atomic"],
-            # line_vals=["triton"],  line_names=["Triton"],
+            line_names=["Triton", "Triton_Atomic"],
             # line styles
             styles=[("green", "-"), ("blue", "-"), ("red", "-")],
             ylabel="tflops",  # label name for the y-axis
@@ -185,14 +187,11 @@ if __name__ == '__main__':
     )
     def benchmark(M, N, K, provider, datatype):
         group_size = 4
-        group_A = []
-        group_B = []
-        A_addrs = []
-        B_addrs = []
-        C_addrs = []
+        num_points = 10000
+        assert M <= num_points, f"M({M}) should be less than num_points({num_points})"
+
         g_sizes = []
         g_lds = []
-        group_C = []
         A_row_index_addrs = []
         C_row_index_addrs = []
         A_row_index_group = [] # to keep indices tensors alive
@@ -206,30 +205,20 @@ if __name__ == '__main__':
             tl_dtype = tl.float16
         else:
             raise ValueError("Invalid datatype")
+
+        input_features = torch.rand((num_points, K), device="cuda", dtype=torch_dtype)
+        output_features = torch.empty((num_points, N), device="cuda", dtype=torch_dtype)
+        weights = torch.rand((group_size, K, N), device="cuda", dtype=torch_dtype)
+
         for i in range(group_size):
-            A = torch.rand((M, K), device="cuda", dtype=torch_dtype)
-            B = torch.rand((K, N), device="cuda", dtype=torch_dtype)
-            C = torch.empty((M, N), device="cuda", dtype=torch_dtype)  # torch_dtype
-
-            A_row_index = torch.randint(0, M, (M, ), device="cuda", dtype=torch.int32)
-            C_row_index = torch.randint(0, M, (M, ), device="cuda", dtype=torch.int32)
-
-            group_A.append(A)
-            group_B.append(B)
-            group_C.append(C)
-            A_addrs.append(A.data_ptr())
-            B_addrs.append(B.data_ptr())
-            C_addrs.append(C.data_ptr())
+            A_row_index = torch.randperm(num_points, device="cuda", dtype=torch.int32)[:M]
+            C_row_index = torch.randperm(num_points, device="cuda", dtype=torch.int32)[:M]
             A_row_index_addrs.append(A_row_index.data_ptr())
             C_row_index_addrs.append(C_row_index.data_ptr())
             A_row_index_group.append(A_row_index) 
             C_row_index_group.append(C_row_index)
             g_sizes += [M, N, K]
-            g_lds += [A.stride(0), B.stride(0), C.stride(0)]
-
-        d_a_ptrs = torch.tensor(A_addrs, device="cuda")
-        d_b_ptrs = torch.tensor(B_addrs, device="cuda")
-        d_c_ptrs = torch.tensor(C_addrs, device="cuda")
+        g_lds = [input_features.stride(0), weights.stride(1), output_features.stride(0)]
         d_a_row_index_ptrs = torch.tensor(A_row_index_addrs, device="cuda")
         d_c_row_index_ptrs = torch.tensor(C_row_index_addrs, device="cuda")
         d_g_sizes = torch.tensor(g_sizes, dtype=torch.int32, device="cuda")
@@ -241,19 +230,19 @@ if __name__ == '__main__':
         # print("M_acc", M_acc, "N_single", N_single, "K_single", K_single)
 
         quantiles = [0.5, 0.2, 0.8]
-        if provider == "cublas":
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: torch_perf_fn(group_A, group_B),
-                quantiles=quantiles,
-                warmup=25,
-                rep=100,
-            )
-        if provider == "triton_atomic":
+        # if provider == "cublas":
+        #     ms, min_ms, max_ms = triton.testing.do_bench(
+        #         lambda: torch_perf_fn(group_A, group_B),
+        #         quantiles=quantiles,
+        #         warmup=25,
+        #         rep=100,
+        #     )
+        if provider == "triton":
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: triton_atomic_perf_fn(
-                    d_a_ptrs,
-                    d_b_ptrs,
-                    d_c_ptrs,
+                    input_features,
+                    weights,
+                    output_features,
                     d_g_sizes,
                     d_a_row_index_ptrs,
                     d_c_row_index_ptrs,
@@ -263,6 +252,28 @@ if __name__ == '__main__':
                     N_single,
                     K_single,
                     tl_dtype=tl_dtype,
+                    atomic_c=False,
+                ),
+                quantiles=quantiles,
+                warmup=25,
+                rep=100,
+            )
+        if provider == "triton_atomic":
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: triton_atomic_perf_fn(
+                    input_features,
+                    weights,
+                    output_features,
+                    d_g_sizes,
+                    d_a_row_index_ptrs,
+                    d_c_row_index_ptrs,
+                    d_g_lds,
+                    group_size,
+                    M_acc,
+                    N_single,
+                    K_single,
+                    tl_dtype=tl_dtype,
+                    atomic_c=True,
                 ),
                 quantiles=quantiles,
                 warmup=25,
@@ -272,13 +283,9 @@ if __name__ == '__main__':
         def perf(time):
             flop = 0
             for i in range(group_size):
-                # flop += 2 * g_sizes[i]
-                flop += (
-                    2 * group_A[i].shape[0] * group_A[i].shape[1] * group_B[i].shape[1]
-                )
+                flop += 2 * g_sizes[3 * i] * g_sizes[3 * i + 1] * g_sizes[3 * i + 2]
             return flop / time * 1e-9
 
         return perf(ms), perf(max_ms), perf(min_ms)
-        # return (ms), (max_ms), perf(min_ms)
 
     benchmark.run(show_plots=True, print_data=True)
